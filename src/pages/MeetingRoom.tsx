@@ -169,8 +169,8 @@ export default function MeetingRoom() {
       users.forEach(participant => {
         if (participant.userId !== user?.id) {
           participantsMap.set(participant.socketId, participant);
-          // Create peer connection for existing users
-          setTimeout(() => createPeerConnection(participant.socketId, true), 100);
+          // Create peer connection for existing users with delay
+          setTimeout(() => createPeerConnection(participant.socketId, true), 500);
         }
       });
       setParticipants(participantsMap);
@@ -180,8 +180,8 @@ export default function MeetingRoom() {
       console.log('User joined:', participant);
       if (participant.userId !== user?.id) {
         setParticipants(prev => new Map(prev.set(participant.socketId, participant)));
-        // Create peer connection for new user
-        setTimeout(() => createPeerConnection(participant.socketId, false), 100);
+        // Create peer connection for new user - let them initiate
+        setTimeout(() => createPeerConnection(participant.socketId, false), 500);
       }
     });
 
@@ -272,6 +272,12 @@ export default function MeetingRoom() {
     try {
       console.log(`Creating peer connection for ${socketId}, isInitiator: ${isInitiator}`);
       
+      // Don't create if already exists
+      if (peerConnectionsRef.current.has(socketId)) {
+        console.log('Peer connection already exists for:', socketId);
+        return peerConnectionsRef.current.get(socketId);
+      }
+      
       const pc = new RTCPeerConnection(rtcConfiguration);
       peerConnectionsRef.current.set(socketId, pc);
 
@@ -285,29 +291,38 @@ export default function MeetingRoom() {
 
       // Handle remote stream
       pc.ontrack = (event) => {
-        console.log('Received remote track:', event);
+        console.log('Received remote track from:', socketId, event);
         const [remoteStream] = event.streams;
         
-        // Update participant with stream
-        setParticipants(prev => {
-          const newMap = new Map(prev);
-          const participant = newMap.get(socketId);
-          if (participant) {
-            participant.stream = remoteStream;
-            newMap.set(socketId, participant);
-            console.log('Updated participant with stream:', participant);
-          }
-          return newMap;
-        });
+        if (remoteStream) {
+          console.log('Setting remote stream for participant:', socketId);
+          
+          // Update participant with stream
+          setParticipants(prev => {
+            const newMap = new Map(prev);
+            const participant = newMap.get(socketId);
+            if (participant) {
+              participant.stream = remoteStream;
+              newMap.set(socketId, participant);
+              console.log('Updated participant with stream:', participant);
+            }
+            return newMap;
+          });
 
-        // Set video element source
-        setTimeout(() => {
+          // Set video element source immediately
           const videoElement = remoteVideosRef.current.get(socketId);
-          if (videoElement && remoteStream) {
+          if (videoElement) {
             videoElement.srcObject = remoteStream;
             console.log('Set remote video stream for:', socketId);
+            
+            // Ensure video plays
+            videoElement.play().catch(e => {
+              console.log('Auto-play prevented, user interaction required');
+            });
+          } else {
+            console.log('Video element not found for:', socketId);
           }
-        }, 100);
+        }
       };
 
       // Handle ICE candidates
@@ -321,6 +336,10 @@ export default function MeetingRoom() {
       // Handle connection state changes
       pc.onconnectionstatechange = () => {
         console.log(`Peer connection state for ${socketId}:`, pc.connectionState);
+        if (pc.connectionState === 'failed') {
+          console.log('Connection failed, attempting to restart ICE');
+          pc.restartIce();
+        }
       };
 
       pc.oniceconnectionstatechange = () => {
@@ -395,7 +414,9 @@ export default function MeetingRoom() {
         await pc.addIceCandidate(candidate);
         console.log('Added ICE candidate');
       } else {
-        console.log('Peer connection not ready for ICE candidate');
+        console.log('Peer connection not ready for ICE candidate, queuing...');
+        // Queue the candidate for later
+        setTimeout(() => handleIceCandidate(candidate, from), 1000);
       }
     } catch (error) {
       console.error('Error handling ICE candidate:', error);
@@ -579,9 +600,10 @@ export default function MeetingRoom() {
         ref={(el) => {
           if (el) {
             remoteVideosRef.current.set(socketId, el);
-            // If participant already has a stream, set it
+            // If participant already has a stream, set it immediately
             if (participant.stream) {
               el.srcObject = participant.stream;
+              el.play().catch(e => console.log('Auto-play prevented'));
             }
           }
         }}
@@ -589,6 +611,10 @@ export default function MeetingRoom() {
         playsInline
         muted={false}
         className="w-full h-full object-cover"
+        onLoadedMetadata={(e) => {
+          console.log('Video metadata loaded for:', socketId);
+          e.currentTarget.play().catch(e => console.log('Auto-play prevented'));
+        }}
       />
       <div className="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm">
         {participant.user.name}
@@ -670,6 +696,9 @@ export default function MeetingRoom() {
                 playsInline
                 muted
                 className="w-full h-full object-cover scale-x-[-1]"
+                onLoadedMetadata={(e) => {
+                  e.currentTarget.play().catch(e => console.log('Auto-play prevented'));
+                }}
               />
               <div className="absolute bottom-2 left-2 bg-black bg-opacity-50 text-white px-2 py-1 rounded text-sm">
                 You {!isAudioEnabled && <MicOff className="inline h-3 w-3 ml-1" />}

@@ -29,7 +29,9 @@ const io = new SocketIOServer(server, {
     credentials: true
   },
   transports: ['websocket', 'polling'],
-  allowEIO3: true
+  allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 app.use(cors({
@@ -469,18 +471,19 @@ io.on('connection', (socket) => {
     participants.delete(socket.id);
   });
 
-  // WebRTC signaling
+  // WebRTC signaling with better logging
   socket.on('webrtc-offer', ({ meetingKey, offer, to }) => {
-    console.log(`WebRTC offer from ${socket.id} to ${to}`);
+    console.log(`WebRTC offer from ${socket.id} to ${to} in room ${meetingKey}`);
+    const fromParticipant = participants.get(socket.id);
     socket.to(to).emit('webrtc-offer', {
       offer,
       from: socket.id,
-      userId: participants.get(socket.id)?.userId,
+      userId: fromParticipant?.userId,
     });
   });
 
   socket.on('webrtc-answer', ({ meetingKey, answer, to }) => {
-    console.log(`WebRTC answer from ${socket.id} to ${to}`);
+    console.log(`WebRTC answer from ${socket.id} to ${to} in room ${meetingKey}`);
     socket.to(to).emit('webrtc-answer', {
       answer,
       from: socket.id,
@@ -488,7 +491,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('webrtc-ice-candidate', ({ meetingKey, candidate, to }) => {
-    console.log(`ICE candidate from ${socket.id} to ${to}`);
+    console.log(`ICE candidate from ${socket.id} to ${to} in room ${meetingKey}`);
     socket.to(to).emit('webrtc-ice-candidate', {
       candidate,
       from: socket.id,
