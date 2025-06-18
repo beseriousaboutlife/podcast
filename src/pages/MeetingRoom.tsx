@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { 
   Mic, MicOff, Video, VideoOff, Phone, PhoneOff, Monitor, 
@@ -69,12 +69,16 @@ export default function MeetingRoom() {
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // WebRTC configuration
+  // WebRTC configuration with better STUN servers
   const rtcConfiguration = {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun3.l.google.com:19302' },
+      { urls: 'stun:stun4.l.google.com:19302' },
     ],
+    iceCandidatePoolSize: 10,
   };
 
   useEffect(() => {
@@ -92,18 +96,21 @@ export default function MeetingRoom() {
 
   const initializeMeeting = async () => {
     try {
+      console.log('Initializing meeting:', meetingKey);
+      
       // Get meeting details
       const meetingData = await api.getMeeting(meetingKey!);
       setMeeting(meetingData);
+      console.log('Meeting data loaded:', meetingData);
 
-      // Initialize media
+      // Initialize media first
       await initializeMedia();
 
       // Connect to socket
       const socket = socketService.connect();
       setupSocketListeners(socket);
 
-      // Join room
+      // Join room with proper user info
       socketService.joinRoom(meetingKey!, {
         userId: user?.id,
         user: {
@@ -116,6 +123,7 @@ export default function MeetingRoom() {
       });
 
       setConnectionStatus('connected');
+      console.log('Meeting initialized successfully');
     } catch (error) {
       console.error('Failed to initialize meeting:', error);
       toast.error('Failed to join meeting');
@@ -125,42 +133,60 @@ export default function MeetingRoom() {
 
   const initializeMedia = async () => {
     try {
+      console.log('Requesting user media...');
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720 },
-        audio: { echoCancellation: true, noiseSuppression: true },
+        video: { 
+          width: { ideal: 1280 }, 
+          height: { ideal: 720 },
+          facingMode: 'user'
+        },
+        audio: { 
+          echoCancellation: true, 
+          noiseSuppression: true,
+          autoGainControl: true
+        },
       });
 
+      console.log('Got user media stream:', stream);
       setLocalStream(stream);
       
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
+        console.log('Set local video stream');
       }
     } catch (error) {
       console.error('Failed to get user media:', error);
-      toast.error('Could not access camera/microphone');
+      toast.error('Could not access camera/microphone. Please check permissions.');
     }
   };
 
   const setupSocketListeners = (socket: any) => {
+    console.log('Setting up socket listeners');
+
     socket.on('room-users', (users: Participant[]) => {
+      console.log('Received room users:', users);
       const participantsMap = new Map();
       users.forEach(participant => {
         if (participant.userId !== user?.id) {
           participantsMap.set(participant.socketId, participant);
-          createPeerConnection(participant.socketId, true);
+          // Create peer connection for existing users
+          setTimeout(() => createPeerConnection(participant.socketId, true), 100);
         }
       });
       setParticipants(participantsMap);
     });
 
     socket.on('user-joined', (participant: Participant) => {
+      console.log('User joined:', participant);
       if (participant.userId !== user?.id) {
         setParticipants(prev => new Map(prev.set(participant.socketId, participant)));
-        createPeerConnection(participant.socketId, true);
+        // Create peer connection for new user
+        setTimeout(() => createPeerConnection(participant.socketId, false), 100);
       }
     });
 
     socket.on('user-left', ({ socketId }: { socketId: string }) => {
+      console.log('User left:', socketId);
       setParticipants(prev => {
         const newMap = new Map(prev);
         newMap.delete(socketId);
@@ -173,17 +199,23 @@ export default function MeetingRoom() {
         pc.close();
         peerConnectionsRef.current.delete(socketId);
       }
+      
+      // Clean up video element
+      remoteVideosRef.current.delete(socketId);
     });
 
     socket.on('webrtc-offer', async ({ offer, from, userId }) => {
+      console.log('Received WebRTC offer from:', from);
       await handleOffer(offer, from, userId);
     });
 
     socket.on('webrtc-answer', async ({ answer, from }) => {
+      console.log('Received WebRTC answer from:', from);
       await handleAnswer(answer, from);
     });
 
     socket.on('webrtc-ice-candidate', async ({ candidate, from }) => {
+      console.log('Received ICE candidate from:', from);
       await handleIceCandidate(candidate, from);
     });
 
@@ -226,78 +258,117 @@ export default function MeetingRoom() {
     });
 
     socket.on('error', ({ message }) => {
+      console.error('Socket error:', message);
       toast.error(message);
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('Socket connection error:', error);
+      toast.error('Connection failed. Please try again.');
     });
   };
 
   const createPeerConnection = async (socketId: string, isInitiator = false) => {
-    const pc = new RTCPeerConnection(rtcConfiguration);
-    peerConnectionsRef.current.set(socketId, pc);
+    try {
+      console.log(`Creating peer connection for ${socketId}, isInitiator: ${isInitiator}`);
+      
+      const pc = new RTCPeerConnection(rtcConfiguration);
+      peerConnectionsRef.current.set(socketId, pc);
 
-    // Add local stream
-    if (localStream) {
-      localStream.getTracks().forEach(track => {
-        pc.addTrack(track, localStream);
-      });
-    }
-
-    // Handle remote stream
-    pc.ontrack = (event) => {
-      const [remoteStream] = event.streams;
-      const videoElement = remoteVideosRef.current.get(socketId);
-      if (videoElement) {
-        videoElement.srcObject = remoteStream;
-      }
-
-      // Update participant with stream info
-      setParticipants(prev => {
-        const newMap = new Map(prev);
-        const participant = newMap.get(socketId);
-        if (participant) {
-          participant.stream = remoteStream;
-          newMap.set(socketId, participant);
-        }
-        return newMap;
-      });
-    };
-
-    // Handle ICE candidates
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socketService.sendIceCandidate(meetingKey!, event.candidate, socketId);
-      }
-    };
-
-    // Create offer if initiator
-    if (isInitiator) {
-      try {
-        const offer = await pc.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: true,
+      // Add local stream tracks
+      if (localStream) {
+        localStream.getTracks().forEach(track => {
+          console.log(`Adding track to peer connection: ${track.kind}`);
+          pc.addTrack(track, localStream);
         });
-        await pc.setLocalDescription(offer);
-        socketService.sendOffer(meetingKey!, offer, socketId);
-      } catch (error) {
-        console.error('Error creating offer:', error);
       }
-    }
 
-    return pc;
+      // Handle remote stream
+      pc.ontrack = (event) => {
+        console.log('Received remote track:', event);
+        const [remoteStream] = event.streams;
+        
+        // Update participant with stream
+        setParticipants(prev => {
+          const newMap = new Map(prev);
+          const participant = newMap.get(socketId);
+          if (participant) {
+            participant.stream = remoteStream;
+            newMap.set(socketId, participant);
+            console.log('Updated participant with stream:', participant);
+          }
+          return newMap;
+        });
+
+        // Set video element source
+        setTimeout(() => {
+          const videoElement = remoteVideosRef.current.get(socketId);
+          if (videoElement && remoteStream) {
+            videoElement.srcObject = remoteStream;
+            console.log('Set remote video stream for:', socketId);
+          }
+        }, 100);
+      };
+
+      // Handle ICE candidates
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          console.log('Sending ICE candidate to:', socketId);
+          socketService.sendIceCandidate(meetingKey!, event.candidate, socketId);
+        }
+      };
+
+      // Handle connection state changes
+      pc.onconnectionstatechange = () => {
+        console.log(`Peer connection state for ${socketId}:`, pc.connectionState);
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        console.log(`ICE connection state for ${socketId}:`, pc.iceConnectionState);
+      };
+
+      // Create offer if initiator
+      if (isInitiator) {
+        try {
+          console.log('Creating offer for:', socketId);
+          const offer = await pc.createOffer({
+            offerToReceiveAudio: true,
+            offerToReceiveVideo: true,
+          });
+          await pc.setLocalDescription(offer);
+          console.log('Sending offer to:', socketId);
+          socketService.sendOffer(meetingKey!, offer, socketId);
+        } catch (error) {
+          console.error('Error creating offer:', error);
+        }
+      }
+
+      return pc;
+    } catch (error) {
+      console.error('Error creating peer connection:', error);
+      return null;
+    }
   };
 
   const handleOffer = async (offer: RTCSessionDescriptionInit, from: string, userId: string) => {
     try {
+      console.log('Handling offer from:', from);
       let pc = peerConnectionsRef.current.get(from);
       if (!pc) {
         pc = await createPeerConnection(from, false);
       }
       
-      await pc.setRemoteDescription(offer);
-      
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      
-      socketService.sendAnswer(meetingKey!, answer, from);
+      if (pc) {
+        await pc.setRemoteDescription(offer);
+        console.log('Set remote description (offer)');
+        
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        console.log('Created and set local description (answer)');
+        
+        socketService.sendAnswer(meetingKey!, answer, from);
+        console.log('Sent answer to:', from);
+      }
     } catch (error) {
       console.error('Error handling offer:', error);
     }
@@ -305,9 +376,11 @@ export default function MeetingRoom() {
 
   const handleAnswer = async (answer: RTCSessionDescriptionInit, from: string) => {
     try {
+      console.log('Handling answer from:', from);
       const pc = peerConnectionsRef.current.get(from);
       if (pc) {
         await pc.setRemoteDescription(answer);
+        console.log('Set remote description (answer)');
       }
     } catch (error) {
       console.error('Error handling answer:', error);
@@ -316,9 +389,13 @@ export default function MeetingRoom() {
 
   const handleIceCandidate = async (candidate: RTCIceCandidate, from: string) => {
     try {
+      console.log('Handling ICE candidate from:', from);
       const pc = peerConnectionsRef.current.get(from);
-      if (pc) {
+      if (pc && pc.remoteDescription) {
         await pc.addIceCandidate(candidate);
+        console.log('Added ICE candidate');
+      } else {
+        console.log('Peer connection not ready for ICE candidate');
       }
     } catch (error) {
       console.error('Error handling ICE candidate:', error);
@@ -331,6 +408,7 @@ export default function MeetingRoom() {
       if (audioTrack) {
         audioTrack.enabled = !audioTrack.enabled;
         setIsAudioEnabled(audioTrack.enabled);
+        console.log('Audio toggled:', audioTrack.enabled);
       }
     }
   };
@@ -341,6 +419,7 @@ export default function MeetingRoom() {
       if (videoTrack) {
         videoTrack.enabled = !videoTrack.enabled;
         setIsVideoEnabled(videoTrack.enabled);
+        console.log('Video toggled:', videoTrack.enabled);
       }
     }
   };
@@ -348,6 +427,7 @@ export default function MeetingRoom() {
   const toggleScreenShare = async () => {
     try {
       if (!isScreenSharing) {
+        console.log('Starting screen share...');
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true,
@@ -387,10 +467,19 @@ export default function MeetingRoom() {
 
   const stopScreenShare = async () => {
     try {
+      console.log('Stopping screen share...');
       // Go back to camera
       const cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
+        video: { 
+          width: { ideal: 1280 }, 
+          height: { ideal: 720 },
+          facingMode: 'user'
+        },
+        audio: { 
+          echoCancellation: true, 
+          noiseSuppression: true,
+          autoGainControl: true
+        },
       });
 
       const videoTrack = cameraStream.getVideoTracks()[0];
@@ -446,14 +535,25 @@ export default function MeetingRoom() {
   };
 
   const cleanup = () => {
+    console.log('Cleaning up meeting room...');
+    
     // Stop local stream
     if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
+      localStream.getTracks().forEach(track => {
+        track.stop();
+        console.log('Stopped local track:', track.kind);
+      });
     }
 
     // Close all peer connections
-    peerConnectionsRef.current.forEach(pc => pc.close());
+    peerConnectionsRef.current.forEach((pc, socketId) => {
+      pc.close();
+      console.log('Closed peer connection for:', socketId);
+    });
     peerConnectionsRef.current.clear();
+
+    // Clear video refs
+    remoteVideosRef.current.clear();
 
     // Leave socket room
     if (meetingKey) {
@@ -479,6 +579,10 @@ export default function MeetingRoom() {
         ref={(el) => {
           if (el) {
             remoteVideosRef.current.set(socketId, el);
+            // If participant already has a stream, set it
+            if (participant.stream) {
+              el.srcObject = participant.stream;
+            }
           }
         }}
         autoPlay
@@ -495,6 +599,18 @@ export default function MeetingRoom() {
           Sharing
         </div>
       )}
+      {!participant.stream && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <div className="text-white text-center">
+            <div className="w-16 h-16 bg-gray-600 rounded-full flex items-center justify-center mx-auto mb-2">
+              <span className="text-2xl font-medium">
+                {participant.user.name.charAt(0)}
+              </span>
+            </div>
+            <p className="text-sm">Connecting...</p>
+          </div>
+        </div>
+      )}
     </div>
   );
 
@@ -504,6 +620,7 @@ export default function MeetingRoom() {
         <div className="text-white text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-4"></div>
           <p>Connecting to meeting...</p>
+          <p className="text-sm text-gray-400 mt-2">Status: {connectionStatus}</p>
         </div>
       </div>
     );
@@ -536,6 +653,7 @@ export default function MeetingRoom() {
           <span className="text-sm text-gray-500">
             {participants.size + 1} participant{participants.size !== 0 ? 's' : ''}
           </span>
+          <span className="text-xs text-gray-400">({connectionStatus})</span>
         </div>
       </header>
 
@@ -559,6 +677,18 @@ export default function MeetingRoom() {
               {isScreenSharing && (
                 <div className="absolute top-2 right-2 bg-blue-600 text-white px-2 py-1 rounded text-xs">
                   Sharing
+                </div>
+              )}
+              {!localStream && (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="text-white text-center">
+                    <div className="w-16 h-16 bg-gray-600 rounded-full flex items-center justify-center mx-auto mb-2">
+                      <span className="text-2xl font-medium">
+                        {user?.name?.charAt(0)}
+                      </span>
+                    </div>
+                    <p className="text-sm">Camera loading...</p>
+                  </div>
                 </div>
               )}
             </div>
@@ -641,6 +771,9 @@ export default function MeetingRoom() {
                       <div className="flex space-x-1">
                         {!participant.audioEnabled && <MicOff className="h-4 w-4 text-red-500" />}
                         {!participant.videoEnabled && <VideoOff className="h-4 w-4 text-red-500" />}
+                        {participant.stream && (
+                          <div className="w-2 h-2 bg-green-500 rounded-full" title="Connected" />
+                        )}
                       </div>
                     </div>
                   ))}

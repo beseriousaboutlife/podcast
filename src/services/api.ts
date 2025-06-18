@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 class ApiService {
   private async request(endpoint: string, options: RequestInit = {}) {
@@ -35,22 +35,22 @@ class ApiService {
 
   // Auth endpoints
   login = (email: string, password: string, deviceId: string) =>
-    this.request('/auth/login', {
+    this.request('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password, deviceId }),
     });
 
   register = (name: string, email: string, password: string) =>
-    this.request('/auth/register', {
+    this.request('/api/auth/register', {
       method: 'POST',
       body: JSON.stringify({ name, email, password }),
     });
 
-  logout = () => this.request('/auth/logout', { method: 'POST' });
+  logout = () => this.request('/api/auth/logout', { method: 'POST' });
 
-  getProfile = () => this.request('/auth/profile');
+  getProfile = () => this.request('/api/auth/profile');
 
-  // Meeting endpoints
+  // Meeting endpoints - Fixed API paths
   createMeeting = (name: string) =>
     this.request('/api/meetings', {
       method: 'POST',

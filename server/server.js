@@ -25,8 +25,11 @@ const server = http.createServer(app);
 const io = new SocketIOServer(server, {
   cors: {
     origin: process.env.CLIENT_URL || "http://localhost:5173",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+    credentials: true
+  },
+  transports: ['websocket', 'polling'],
+  allowEIO3: true
 });
 
 app.use(cors({
@@ -78,6 +81,32 @@ const pool = new pg.Pool({
 // Initialize database tables
 const initializeDatabase = async () => {
   try {
+    // Create users table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        password TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        github_token TEXT
+      );
+    `);
+
+    // Create sessions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        ip_address TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        jwt_id TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMPTZ NOT NULL,
+        revoked BOOLEAN DEFAULT false
+      );
+    `);
+
     // Create podcast_sessions table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS podcast_sessions (
@@ -386,7 +415,7 @@ io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
   socket.on('join-room', ({ meetingKey, userInfo }) => {
-    console.log(`User ${socket.id} joining room ${meetingKey}`);
+    console.log(`User ${socket.id} (${userInfo.user?.name}) joining room ${meetingKey}`);
     
     socket.join(meetingKey);
     
@@ -395,8 +424,8 @@ io.on('connection', (socket) => {
       socketId: socket.id,
       userId: userInfo.userId || socket.id,
       user: userInfo.user || { name: 'Anonymous' },
-      audioEnabled: userInfo.audioEnabled || true,
-      videoEnabled: userInfo.videoEnabled || true,
+      audioEnabled: userInfo.audioEnabled !== undefined ? userInfo.audioEnabled : true,
+      videoEnabled: userInfo.videoEnabled !== undefined ? userInfo.videoEnabled : true,
       meetingKey,
     });
 
@@ -410,6 +439,8 @@ io.on('connection', (socket) => {
     const roomParticipants = Array.from(rooms.get(meetingKey))
       .map(socketId => participants.get(socketId))
       .filter(Boolean);
+
+    console.log(`Room ${meetingKey} now has ${roomParticipants.length} participants`);
 
     // Send current participants to the new user
     socket.emit('room-users', roomParticipants);
@@ -440,6 +471,7 @@ io.on('connection', (socket) => {
 
   // WebRTC signaling
   socket.on('webrtc-offer', ({ meetingKey, offer, to }) => {
+    console.log(`WebRTC offer from ${socket.id} to ${to}`);
     socket.to(to).emit('webrtc-offer', {
       offer,
       from: socket.id,
@@ -448,6 +480,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('webrtc-answer', ({ meetingKey, answer, to }) => {
+    console.log(`WebRTC answer from ${socket.id} to ${to}`);
     socket.to(to).emit('webrtc-answer', {
       answer,
       from: socket.id,
@@ -455,6 +488,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('webrtc-ice-candidate', ({ meetingKey, candidate, to }) => {
+    console.log(`ICE candidate from ${socket.id} to ${to}`);
     socket.to(to).emit('webrtc-ice-candidate', {
       candidate,
       from: socket.id,
@@ -471,6 +505,7 @@ io.on('connection', (socket) => {
         timestamp: new Date().toISOString(),
       };
       
+      console.log(`Chat message in ${meetingKey} from ${participant.user.name}: ${message}`);
       io.to(meetingKey).emit('chat-message', chatMessage);
     }
   });
@@ -480,6 +515,7 @@ io.on('connection', (socket) => {
     const participant = participants.get(socket.id);
     if (participant) {
       participant.isScreenSharing = true;
+      console.log(`${participant.user.name} started screen sharing in ${meetingKey}`);
       socket.to(meetingKey).emit('user-started-screen-share', {
         userId: participant.userId,
         socketId: socket.id,
@@ -491,6 +527,7 @@ io.on('connection', (socket) => {
     const participant = participants.get(socket.id);
     if (participant) {
       participant.isScreenSharing = false;
+      console.log(`${participant.user.name} stopped screen sharing in ${meetingKey}`);
       socket.to(meetingKey).emit('user-stopped-screen-share', {
         userId: participant.userId,
         socketId: socket.id,
@@ -502,6 +539,7 @@ io.on('connection', (socket) => {
   socket.on('start-recording', ({ meetingKey }) => {
     const participant = participants.get(socket.id);
     if (participant) {
+      console.log(`${participant.user.name} started recording in ${meetingKey}`);
       io.to(meetingKey).emit('recording-started', {
         user: participant.user,
       });
@@ -511,6 +549,7 @@ io.on('connection', (socket) => {
   socket.on('stop-recording', ({ meetingKey }) => {
     const participant = participants.get(socket.id);
     if (participant) {
+      console.log(`${participant.user.name} stopped recording in ${meetingKey}`);
       io.to(meetingKey).emit('recording-stopped', {
         user: participant.user,
       });
@@ -535,14 +574,31 @@ io.on('connection', (socket) => {
 
       // Notify others
       socket.to(meetingKey).emit('user-left', { socketId: socket.id });
+      console.log(`Cleaned up participant ${participant.user.name} from ${meetingKey}`);
     }
     
     // Remove participant
     participants.delete(socket.id);
+  });
+
+  // Handle connection errors
+  socket.on('error', (error) => {
+    console.error('Socket error for', socket.id, ':', error);
+  });
+});
+
+// Add health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    rooms: rooms.size,
+    participants: participants.size
   });
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`CORS origin: ${process.env.CLIENT_URL || "http://localhost:5173"}`);
 });
